@@ -1,4 +1,5 @@
-// Signaling Server - Deploy this on Render/Railway/Glitch (Free)
+// Signaling Server for Direct Call System
+// Deploy on Render/Railway/Glitch
 // File: server.js
 
 const express = require('express');
@@ -18,114 +19,123 @@ const io = socketIO(server, {
 app.use(cors());
 app.use(express.json());
 
-// Store connected users
-const users = new Map();
-const rooms = new Map();
+// Store users with their call IDs
+const users = new Map(); // socketId -> { callId, username, socketId }
+const callIdToSocket = new Map(); // callId -> socketId
 
 app.get('/', (req, res) => {
     res.json({
-        status: 'Signaling Server Running',
-        users: users.size,
-        rooms: rooms.size
+        status: 'Direct Call Signaling Server',
+        connectedUsers: users.size,
+        activeCallIds: Array.from(callIdToSocket.keys())
     });
 });
 
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    console.log('✅ User connected:', socket.id);
 
-    // User registers with a username
-    socket.on('register', (username) => {
-        users.set(socket.id, { username, socketId: socket.id });
-        io.emit('users-update', Array.from(users.values()));
-        console.log(`${username} registered`);
-    });
-
-    // Get all online users
-    socket.on('get-users', () => {
-        socket.emit('users-update', Array.from(users.values()));
-    });
-
-    // Create or join a room
-    socket.on('join-room', (roomId) => {
-        socket.join(roomId);
-
-        if (!rooms.has(roomId)) {
-            rooms.set(roomId, new Set());
+    // Register user with Call ID
+    socket.on('register', ({ callId, username }) => {
+        // Check if Call ID is already taken
+        if (callIdToSocket.has(callId) && callIdToSocket.get(callId) !== socket.id) {
+            socket.emit('error', 'Call ID already in use. Please choose another.');
+            return;
         }
-        rooms.get(roomId).add(socket.id);
 
-        // Notify others in the room
-        socket.to(roomId).emit('user-joined', socket.id);
-        console.log(`${socket.id} joined room ${roomId}`);
+        // Store user data
+        users.set(socket.id, { callId, username, socketId: socket.id });
+        callIdToSocket.set(callId, socket.id);
+
+        socket.emit('registered', { callId, socketId: socket.id });
+        console.log(`📝 ${username} registered with Call ID: ${callId}`);
     });
 
-    // WebRTC Signaling
-    socket.on('offer', (data) => {
-        console.log('Offer from', socket.id, 'to', data.to);
-        io.to(data.to).emit('offer', {
+    // Check if Call ID exists
+    socket.on('check-call-id', (targetCallId) => {
+        const targetSocketId = callIdToSocket.get(targetCallId);
+        const exists = !!targetSocketId && targetSocketId !== socket.id;
+        socket.emit('call-id-status', { callId: targetCallId, exists });
+    });
+
+    // Initiate call to a Call ID
+    socket.on('call-user', ({ targetCallId }) => {
+        const targetSocketId = callIdToSocket.get(targetCallId);
+        const caller = users.get(socket.id);
+
+        if (!targetSocketId) {
+            socket.emit('error', 'User not found or offline');
+            return;
+        }
+
+        if (targetSocketId === socket.id) {
+            socket.emit('error', 'Cannot call yourself');
+            return;
+        }
+
+        const targetUser = users.get(targetSocketId);
+        
+        console.log(`📞 Call from ${caller?.username} (${caller?.callId}) to ${targetUser?.username} (${targetCallId})`);
+
+        io.to(targetSocketId).emit('call-request', {
             from: socket.id,
-            offer: data.offer
+            fromName: caller?.username,
+            fromCallId: caller?.callId
         });
     });
 
-    socket.on('answer', (data) => {
-        console.log('Answer from', socket.id, 'to', data.to);
-        io.to(data.to).emit('answer', {
-            from: socket.id,
-            answer: data.answer
-        });
+    // Call accepted
+    socket.on('call-accepted', ({ to }) => {
+        console.log('✅ Call accepted');
+        io.to(to).emit('call-accepted', { from: socket.id });
     });
 
-    socket.on('ice-candidate', (data) => {
-        io.to(data.to).emit('ice-candidate', {
-            from: socket.id,
-            candidate: data.candidate
-        });
+    // Call rejected
+    socket.on('call-rejected', ({ to }) => {
+        console.log('❌ Call rejected');
+        io.to(to).emit('call-rejected');
     });
 
-    // Call initiation
-    socket.on('call-user', (data) => {
-        io.to(data.to).emit('incoming-call', {
-            from: socket.id,
-            fromUser: users.get(socket.id)?.username
-        });
-    });
-
-    socket.on('call-accepted', (data) => {
-        io.to(data.to).emit('call-accepted', {
+    // WebRTC Offer
+    socket.on('offer', ({ offer, to }) => {
+        console.log('📤 Offer forwarded');
+        io.to(to).emit('offer', {
+            offer,
             from: socket.id
         });
     });
 
-    socket.on('call-rejected', (data) => {
-        io.to(data.to).emit('call-rejected', {
-            from: socket.id
-        });
+    // WebRTC Answer
+    socket.on('answer', ({ answer, to }) => {
+        console.log('📥 Answer forwarded');
+        io.to(to).emit('answer', { answer });
     });
 
-    socket.on('end-call', (data) => {
-        io.to(data.to).emit('call-ended', {
-            from: socket.id
-        });
+    // ICE Candidate
+    socket.on('ice-candidate', ({ candidate, to }) => {
+        if (to) {
+            io.to(to).emit('ice-candidate', { candidate });
+        }
     });
 
+    // End call
+    socket.on('end-call', ({ to }) => {
+        if (to) {
+            io.to(to).emit('call-ended');
+        }
+    });
+
+    // Disconnect
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        users.delete(socket.id);
-
-        // Remove from rooms
-        rooms.forEach((members, roomId) => {
-            if (members.has(socket.id)) {
-                members.delete(socket.id);
-                socket.to(roomId).emit('user-left', socket.id);
-            }
-        });
-
-        io.emit('users-update', Array.from(users.values()));
+        const user = users.get(socket.id);
+        if (user) {
+            console.log(`👋 ${user.username} (${user.callId}) disconnected`);
+            callIdToSocket.delete(user.callId);
+            users.delete(socket.id);
+        }
     });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-    console.log(`Signaling server running on port ${PORT}`);
+    console.log(`🚀 Signaling server running on port ${PORT}`);
 });
